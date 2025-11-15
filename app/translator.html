@@ -151,7 +151,7 @@
 
       try {
         translationText.innerText = "Loading FSL classifier...";
-        fslModel = await tf.loadLayersModel(FSL_MODEL_PATH);
+        fslModel = await tf.loadGraphModel(FSL_MODEL_PATH);
         console.log("FSL classifier loaded:", fslModel);
 
         // try to load labels.json if available
@@ -266,46 +266,77 @@
             if (fslModel && labelMap) {
               // Use first detected hand for single-letter detection
               const first = results.landmarks[0]; // array of 21 {x,y,z}
-              const inputVector = [];
 
-              // Flatten normalized x,y,z into a 63-length vector (21 * 3)
-              for (let i = 0; i < first.length; i++) {
-                const lm = first[i];
-                // Use x,y,z normalized coordinates directly
-                inputVector.push(lm.x);
-                inputVector.push(lm.y);
-                inputVector.push(lm.z);
+              // Get bounding box from landmarks
+              let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+              for (const lm of first) {
+                minX = Math.min(minX, lm.x);
+                minY = Math.min(minY, lm.y);
+                maxX = Math.max(maxX, lm.x);
+                maxY = Math.max(maxY, lm.y);
               }
 
-              // Predict with tf.tidy to avoid memory leaks
-              const pred = await tf.tidy(() => {
-                // model expects shape [1, N] where N==inputVector.length
-                const t = tf.tensor2d([inputVector]);
-                const out = fslModel.predict(t);
-                // either get logits or probabilities
-                let probs = out;
-                if (Array.isArray(out)) probs = out[0];
-                return probs.array();
-              });
+              // Expand bounding box slightly
+              const margin = 0.1;
+              const width = maxX - minX;
+              const height = maxY - minY;
+              minX -= width * margin;
+              minY -= height * margin;
+              maxX += width * margin;
+              maxY += height * margin;
 
-              // pred is [[p0, p1, ...]]
-              if (pred && pred[0]) {
-                const probsArray = pred[0];
-                let bestIdx = 0;
-                let bestVal = probsArray[0];
-                for (let i = 1; i < probsArray.length; i++) {
-                  if (probsArray[i] > bestVal) {
-                    bestVal = probsArray[i];
-                    bestIdx = i;
-                  }
+              // Clamp to [0,1]
+              minX = Math.max(0, minX);
+              minY = Math.max(0, minY);
+              maxX = Math.min(1, maxX);
+              maxY = Math.min(1, maxY);
+
+              // Crop and resize image
+              const imgWidth = video.videoWidth;
+              const imgHeight = video.videoHeight;
+              const cropX = minX * imgWidth;
+              const cropY = minY * imgHeight;
+              const cropW = (maxX - minX) * imgWidth;
+              const cropH = (maxY - minY) * imgHeight;
+
+              // Create temp canvas for cropping
+              const tempCanvas = document.createElement('canvas');
+              tempCanvas.width = cropW;
+              tempCanvas.height = cropH;
+              const tempCtx = tempCanvas.getContext('2d');
+              tempCtx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+
+              // Resize to 64x64
+              const resizedCanvas = document.createElement('canvas');
+              resizedCanvas.width = 64;
+              resizedCanvas.height = 64;
+              const resizedCtx = resizedCanvas.getContext('2d');
+              resizedCtx.drawImage(tempCanvas, 0, 0, 64, 64);
+
+              // Convert to tensor and normalize
+              const imgTensor = tf.browser.fromPixels(resizedCanvas).toFloat().div(255).expandDims(0);
+
+              // Predict
+              const pred = fslModel.predict(imgTensor);
+              const probs = pred.arraySync()[0];
+
+              // Find best prediction
+              let bestIdx = 0;
+              let bestVal = probs[0];
+              for (let i = 1; i < probs.length; i++) {
+                if (probs[i] > bestVal) {
+                  bestVal = probs[i];
+                  bestIdx = i;
                 }
-
-                const label = labelMap[bestIdx] || `Class ${bestIdx}`;
-                const confidence = (bestVal * 100).toFixed(1);
-                translationText.innerText = `${label} (${confidence}%)`;
-              } else {
-                translationText.innerText = "Prediction failed";
               }
+
+              const label = labelMap[bestIdx] || `Class ${bestIdx}`;
+              const confidence = (bestVal * 100).toFixed(1);
+              translationText.innerText = `${label} (${confidence}%)`;
+
+              // Clean up tensors
+              imgTensor.dispose();
+              pred.dispose();
             } else {
               // If classifier not available, show simple status
               translationText.innerText = "Hand Detected!";
